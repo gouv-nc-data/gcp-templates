@@ -3,6 +3,8 @@ import argparse
 from typing import Optional
 from logging import Logger
 import time
+from google.cloud import bigquery
+from google.api_core.exceptions import NotFound
 
 
 def get_logger(spark: SparkSession) -> Logger:
@@ -18,6 +20,26 @@ def get_logger(spark: SparkSession) -> Logger:
 
     log_4j_logger = spark.sparkContext._jvm.org.apache.log4j  # pylint: disable=protected-access
     return log_4j_logger.LogManager.getLogger(__name__)
+
+def create_dataset_if_not_exists(spark: SparkSession, project_id: str, dataset_id: str, location: str = "EU"):
+    """
+    Crée le dataset BigQuery s'il n'existe pas.
+    """
+    client = bigquery.Client()
+    dataset_ref = f"{project_id}.{dataset_id}"
+    
+    try:
+        client.get_dataset(dataset_ref)
+        get_logger(spark).info(f"Le dataset {dataset_ref} existe déjà.")
+    except NotFound:
+        get_logger(spark).info(f"Le dataset {dataset_ref} n'a pas été trouvé. Création en cours...")
+        dataset = bigquery.Dataset(dataset_ref)
+        dataset.location = location
+        client.create_dataset(dataset, timeout=30)
+        get_logger(spark).info(f"Dataset {dataset_ref} créé avec succès dans la localisation {location}.")
+    except Exception as e:
+        get_logger(spark).error(f"Erreur lors de la vérification/création du dataset : {e}")
+        # On ne bloque pas forcément l'exécution car Spark pourrait échouer plus tard si nécessaire
 
 def get_table_size_bytes(spark: SparkSession, url: str, table_name: str) -> int:
     """
@@ -169,11 +191,12 @@ if __name__ == '__main__':
     
     parser.add_argument(
         '--only',
+        '--only-tables',
         type=str,
         dest='only',
         required=False,
         default="",
-        help='tables à inclure dans la migration')
+        help='tables à inclure dans la migration (alias --only-tables supporté)')
 
     parser.add_argument(
         '--bucket',
@@ -195,6 +218,20 @@ if __name__ == '__main__':
     if input_url[:5] != "jdbc:":
         input_url = "jdbc:%s" % known_args.jdbc_url
     
+    # Création du dataset si nécessaire avant de lancer Spark
+    # On utilise le client BigQuery pour s'assurer que le dataset existe
+    client = bigquery.Client()
+    dataset_parts = known_args.dataset.split('.')
+    if len(dataset_parts) > 1:
+        project_id = dataset_parts[0]
+        dataset_id = dataset_parts[1]
+    else:
+        # Si pas de point, on utilise le projet configuré par défaut pour le client
+        project_id = client.project
+        dataset_id = known_args.dataset
+
+    create_dataset_if_not_exists(spark, project_id, dataset_id)
+
     if known_args.only != "":
         get_logger(spark).info("only est défini, exclusion ignorée")
         known_args.exclude = ""
