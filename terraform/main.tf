@@ -1,6 +1,12 @@
 locals {
   parent_folder_id            = "658965356947" # production folder
   postgresl_driver_remote_url = "https://repo1.maven.org/maven2/org/postgresql/postgresql/42.2.6/postgresql-42.2.6.jar"
+
+  # Comptes de service des nœuds GKE autorisés à lire les images
+  gke_node_service_accounts = [
+    "serviceAccount:418797213054-compute@developer.gserviceaccount.com",
+    "serviceAccount:gke-nodes-sa@prj-dinum-gke-f8f8.iam.gserviceaccount.com"
+  ]
 }
 
 module "project-factory" {
@@ -61,5 +67,16 @@ resource "google_project_iam_member" "service_account_bindings" {
   project = module.project-factory.project_id
   role    = "roles/artifactregistry.admin"
   member  = "serviceAccount:${google_service_account.service_account.email}"
+}
+
+# ----------------------------------------------------
+# Accès cross-project pour les clusters GKE
+# ----------------------------------------------------
+resource "google_project_iam_member" "gke_nodes_artifact_registry_reader" {
+  for_each = toset(local.gke_node_service_accounts)
+
+  project = module.project-factory.project_id
+  role    = "roles/artifactregistry.reader"
+  member  = each.value
 }
 
