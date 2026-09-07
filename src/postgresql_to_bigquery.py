@@ -96,29 +96,40 @@ def sync_target_schema(spark: SparkSession, client: bigquery.Client, table_id: s
         client.delete_table(table_id)
 
 
-def check_uploaded_rows(spark: SparkSession, client: bigquery.Client, table_id: str, expected_rows: int,
+def get_table_modified(client: bigquery.Client, table_id: str):
+    """
+    Date de dernière modification de la table BigQuery, None si elle n'existe pas.
+    """
+    try:
+        return client.get_table(table_id).modified
+    except NotFound:
+        return None
+
+
+def check_table_written(client: bigquery.Client, table_id: str, previous_modified,
                         attempts: int = 3, delay_seconds: int = 5):
     """
-    Vérifie que la table BigQuery contient bien les lignes attendues.
+    Vérifie que l'écriture a bien été appliquée à la table BigQuery.
 
     Le connecteur spark-bigquery avale les erreurs d'écriture (WARN
     "unexpected issue trying to save" puis writer "aborted") sans les remonter à
     PySpark : sans ce contrôle, une table peut rester périmée alors que le batch
-    se termine en SUCCEEDED.
+    se termine en SUCCEEDED. Une écriture abandonnée laisse la table inchangée,
+    donc sa date de modification n'avance pas.
+
+    On compare des dates plutôt que des nombres de lignes : la source reste en
+    écriture pendant la migration, un écart de comptage serait normal.
     """
     for attempt in range(attempts):
-        try:
-            actual_rows = client.get_table(table_id).num_rows
-        except NotFound:
-            actual_rows = None
-        if actual_rows == expected_rows:
+        modified = get_table_modified(client, table_id)
+        if modified is not None and (previous_modified is None or modified > previous_modified):
             return
         if attempt < attempts - 1:
             time.sleep(delay_seconds)
 
     raise RuntimeError(
-        "table %s : %s lignes dans BigQuery, %s attendues depuis la source"
-        % (table_id, actual_rows, expected_rows))
+        "table %s : écriture non appliquée (date de modification inchangée : %s)"
+        % (table_id, previous_modified))
 
 
 def upload_table(spark: SparkSession, client: bigquery.Client, table_name: str, url: str, dataset: str, mode: str, bucket: str):
@@ -131,8 +142,7 @@ def upload_table(spark: SparkSession, client: bigquery.Client, table_name: str, 
     elapsed_time = time.time() - start_time
     get_logger(spark).info(f"Table {table_name['table_name']} chargée en {elapsed_time:.2f} secondes.")
     
-    row_count = df.count()
-    get_logger(spark).info(f"Nombre de lignes dans la table {table_name['table_name']}: {row_count}")
+    get_logger(spark).info(f"Nombre de lignes dans la table {table_name['table_name']}: {df.count()}")
     # get_logger(spark).info(f"Schéma de la table {table_name['table_name']}: {df.dtypes}")
     # try:
     #     get_logger(spark).info(f"Premières lignes de la table {table_name['table_name']}: {df.head(5)}")
@@ -161,8 +171,10 @@ def upload_table(spark: SparkSession, client: bigquery.Client, table_name: str, 
     get_logger(spark).info("upload de la table %s" % table_name['table_name'])
 
     table_id = "%s.%s" % (dataset, table_name['table_name'])
+    previous_modified = None
     if mode == "overwrite":
         sync_target_schema(spark, client, table_id, df)
+        previous_modified = get_table_modified(client, table_id)
 
     start_time = time.time()
     if len(bucket) > 0:
@@ -183,7 +195,7 @@ def upload_table(spark: SparkSession, client: bigquery.Client, table_name: str, 
     get_logger(spark).info(f"Table {table_name['table_name']} uploadée en {elapsed_time:.2f} secondes.")
 
     if mode == "overwrite":
-        check_uploaded_rows(spark, client, table_id, row_count)
+        check_table_written(client, table_id, previous_modified)
 
 def query_factory(schema: str, exclude: str = None, only: str = None) -> str:
     if exclude != "":
