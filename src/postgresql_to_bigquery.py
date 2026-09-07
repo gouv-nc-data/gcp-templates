@@ -61,7 +61,67 @@ def get_table_size_bytes(spark: SparkSession, url: str, table_name: str) -> int:
         get_logger(spark).warning(f"Impossible d'estimer la taille de la table {table_name}: {e}. Utilisation d'une valeur par défaut.")
         return 0 # Retourne 0 en cas d'erreur
 
-def upload_table(spark: SparkSession, table_name: str, url: str, dataset: str, mode: str, bucket: str):
+def schema_delta(bq_columns, source_columns):
+    """
+    Compare les colonnes d'une table BigQuery et celles de la source.
+
+    Returns:
+        tuple: (colonnes ajoutées côté source, colonnes disparues de la source)
+    """
+    bq_set = {c.lower() for c in bq_columns}
+    source_set = {c.lower() for c in source_columns}
+    return sorted(source_set - bq_set), sorted(bq_set - source_set)
+
+
+def sync_target_schema(spark: SparkSession, client: bigquery.Client, table_id: str, df):
+    """
+    Supprime la table BigQuery si son schéma ne correspond plus à celui de la source.
+
+    Le writeMethod "direct" réutilise le schéma de la table existante : une colonne
+    ajoutée côté PostgreSQL fait échouer l'écriture avec
+    "Inserted row has wrong column count", et le connecteur se contente d'un WARN.
+    Le mode "overwrite" recharge la table entièrement à chaque run : la supprimer
+    laisse le connecteur la recréer avec le schéma courant, sans perte de données.
+    """
+    try:
+        table = client.get_table(table_id)
+    except NotFound:
+        return
+
+    added, removed = schema_delta([field.name for field in table.schema], df.columns)
+    if added or removed:
+        get_logger(spark).info(
+            "schéma modifié pour %s (colonnes ajoutées: %s, supprimées: %s), suppression de la table pour recréation"
+            % (table_id, added, removed))
+        client.delete_table(table_id)
+
+
+def check_uploaded_rows(spark: SparkSession, client: bigquery.Client, table_id: str, expected_rows: int,
+                        attempts: int = 3, delay_seconds: int = 5):
+    """
+    Vérifie que la table BigQuery contient bien les lignes attendues.
+
+    Le connecteur spark-bigquery avale les erreurs d'écriture (WARN
+    "unexpected issue trying to save" puis writer "aborted") sans les remonter à
+    PySpark : sans ce contrôle, une table peut rester périmée alors que le batch
+    se termine en SUCCEEDED.
+    """
+    for attempt in range(attempts):
+        try:
+            actual_rows = client.get_table(table_id).num_rows
+        except NotFound:
+            actual_rows = None
+        if actual_rows == expected_rows:
+            return
+        if attempt < attempts - 1:
+            time.sleep(delay_seconds)
+
+    raise RuntimeError(
+        "table %s : %s lignes dans BigQuery, %s attendues depuis la source"
+        % (table_id, actual_rows, expected_rows))
+
+
+def upload_table(spark: SparkSession, client: bigquery.Client, table_name: str, url: str, dataset: str, mode: str, bucket: str):
     get_logger(spark).info("migration table %s" % table_name['table_name'])
     start_time = time.time()
 
@@ -71,7 +131,8 @@ def upload_table(spark: SparkSession, table_name: str, url: str, dataset: str, m
     elapsed_time = time.time() - start_time
     get_logger(spark).info(f"Table {table_name['table_name']} chargée en {elapsed_time:.2f} secondes.")
     
-    get_logger(spark).info(f"Nombre de lignes dans la table {table_name['table_name']}: {df.count()}")
+    row_count = df.count()
+    get_logger(spark).info(f"Nombre de lignes dans la table {table_name['table_name']}: {row_count}")
     # get_logger(spark).info(f"Schéma de la table {table_name['table_name']}: {df.dtypes}")
     # try:
     #     get_logger(spark).info(f"Premières lignes de la table {table_name['table_name']}: {df.head(5)}")
@@ -99,13 +160,17 @@ def upload_table(spark: SparkSession, table_name: str, url: str, dataset: str, m
 
     get_logger(spark).info("upload de la table %s" % table_name['table_name'])
 
+    table_id = "%s.%s" % (dataset, table_name['table_name'])
+    if mode == "overwrite":
+        sync_target_schema(spark, client, table_id, df)
+
     start_time = time.time()
     if len(bucket) > 0:
         df.write \
             .format("bigquery") \
             .option("temporaryGcsBucket", bucket) \
             .mode(mode) \
-            .save("%s.%s" % (dataset, table_name['table_name']))
+            .save(table_id)
     else:
         df.write \
             .format("bigquery") \
@@ -113,9 +178,12 @@ def upload_table(spark: SparkSession, table_name: str, url: str, dataset: str, m
             .option("allowFieldAddition", "true") \
             .option("allowFieldRelaxation", "true") \
             .mode(mode) \
-            .save("%s.%s" % (dataset, table_name['table_name']))
+            .save(table_id)
     elapsed_time = time.time() - start_time
     get_logger(spark).info(f"Table {table_name['table_name']} uploadée en {elapsed_time:.2f} secondes.")
+
+    if mode == "overwrite":
+        check_uploaded_rows(spark, client, table_id, row_count)
 
 def query_factory(schema: str, exclude: str = None, only: str = None) -> str:
     if exclude != "":
@@ -143,8 +211,19 @@ def run(spark: SparkSession, app_name: Optional[str], schema: str, url: str, dat
 
     get_logger(spark).info("migration de %s tables" % table_names.count())
 
+    client = bigquery.Client()
+    failed_tables = []
     for table_name in table_names.collect():
-        upload_table(spark, table_name, url, dataset, mode, bucket)
+        try:
+            upload_table(spark, client, table_name, url, dataset, mode, bucket)
+        except Exception as e:
+            get_logger(spark).error(
+                "échec de la migration de la table %s : %s" % (table_name['table_name'], e))
+            failed_tables.append(table_name['table_name'])
+
+    if failed_tables:
+        raise RuntimeError("échec de la migration de %d table(s) : %s"
+                           % (len(failed_tables), ", ".join(failed_tables)))
 
     get_logger(spark).info("fin migration")
 
